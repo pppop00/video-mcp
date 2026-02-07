@@ -1,4 +1,9 @@
-# video-mcp first frame batch generator
+# video-mcp image tools
+
+当前项目包含两个脚本：
+
+- `batch_make_first_frame.py`：基于输入图片批量生成首帧图。
+- `generate_video_dataset_from_images.py`：基于输入图片批量生成多帧样本与 `metadata.jsonl`。
 
 批量读取 PNG/JPG/JPEG 图片，按你提供的版式生成首帧图，并输出为：
 
@@ -26,7 +31,7 @@ python3 batch_make_first_frame.py \
   --workers 8
 ```
 
-## 3. 常用参数
+## 3. 首帧脚本常用参数
 
 - `--recursive`：递归读取子目录中的 PNG/JPG/JPEG。
 - `--width/--height`：输出分辨率，默认 `1920x1080`。
@@ -94,3 +99,18 @@ python3 generate_video_dataset_from_images.py \
 - `overlay_mode`
 - `highlight_start/highlight_end`
 - `frames_dir`
+
+## 6. 多帧脚本常用参数
+
+- `--overlay-mode`：`first_frame_only` 或 `all_frames`，控制题面显示帧范围。
+- `--highlight-start/--highlight-end`：答案框高亮帧区间；`--highlight-end` 默认最后一帧。
+- `--answer`：当前一次运行内所有 sample 共用同一个正确答案（A/B/C/D）。
+- `--max-samples`：只处理前 N 张图，适合小规模试跑。
+- `--seed`：控制每个 sample 的轻微镜头运动参数，便于复现结果。
+- `--recursive`：递归读取子目录中的 PNG/JPG/JPEG。
+
+## 7. 行为说明
+
+- 多帧脚本输出目录固定为 `output-dir/split/sample_id/frames/frame_XXXX.png`。
+- `sample_id` 为从 `000000` 开始的顺序编号。
+- `metadata.jsonl` 位于 `output-dir/split/metadata.jsonl`，每行对应一个 sample。
