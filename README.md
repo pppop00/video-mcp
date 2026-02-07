@@ -51,3 +51,46 @@ python3 batch_make_first_frame.py \
 
 - `/data/first_frames/image1_first_frame_02-07-26-002824.png`
 - `/data/first_frames/cat_first_frame_02-07-26-002825.png`
+
+## 5. 基于现有图片数据集生成多帧样本 + metadata.jsonl
+
+如果你不想“从零合成场景”，而是要基于已有图片数据集生成视频帧序列，可用：
+
+```bash
+python3 generate_video_dataset_from_images.py \
+  --input-dir /data/my_images \
+  --output-dir /data/video_dataset \
+  --split train \
+  --question "这张图的主要物体是什么？" \
+  --option-a "时钟" \
+  --option-b "猫头鹰" \
+  --option-c "蜡烛" \
+  --option-d "其他" \
+  --answer B \
+  --fps 16 \
+  --seconds 3 \
+  --width 1024 \
+  --height 768 \
+  --overlay-mode all_frames \
+  --workers 8 \
+  --recursive
+```
+
+输出结构示例：
+
+- `/data/video_dataset/train/000000/frames/frame_0000.png`
+- `/data/video_dataset/train/000000/frames/frame_0001.png`
+- `/data/video_dataset/train/metadata.jsonl`
+
+`metadata.jsonl` 每行包含：
+
+- `sample_id`
+- `split`
+- `source_image`
+- `width/height/fps/seconds/num_frames`
+- `question`
+- `choices`
+- `answer`
+- `overlay_mode`
+- `highlight_start/highlight_end`
+- `frames_dir`
