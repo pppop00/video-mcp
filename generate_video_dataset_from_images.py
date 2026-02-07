@@ -8,8 +8,6 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
 from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_QUESTION = "Question"
@@ -60,53 +58,73 @@ def iter_images(input_dir: Path, recursive: bool) -> list[Path]:
     return [p for p in files if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
 
 
-def wrap_text(
+def fit_rect(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    scale = min(max_w / src_w, max_h / src_h)
+    return max(1, int(src_w * scale)), max(1, int(src_h * scale))
+
+
+def draw_centered_text(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[int, int, int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int] = (0, 0, 0),
+) -> None:
+    x1, y1, x2, y2 = rect
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = x1 + (x2 - x1 - tw) // 2
+    ty = y1 + (y2 - y1 - th) // 2
+    draw.text((tx, ty), text, fill=fill, font=font)
+
+
+def wrap_text_multiline(
     draw: ImageDraw.ImageDraw,
     text: str,
     font: ImageFont.ImageFont,
     max_width: int,
-) -> list[str]:
+) -> str:
     words = text.split()
-    if words:
+    if not words:
+        chars = list(text)
+        if not chars:
+            return text
         lines: list[str] = []
-        current = words[0]
-        for word in words[1:]:
-            test = f"{current} {word}"
+        current = chars[0]
+        for ch in chars[1:]:
+            test = f"{current}{ch}"
             bbox = draw.textbbox((0, 0), test, font=font)
             if (bbox[2] - bbox[0]) <= max_width:
                 current = test
             else:
                 lines.append(current)
-                current = word
+                current = ch
         lines.append(current)
-        return lines
+        return "\n".join(lines)
 
-    if not text:
-        return [""]
-
-    chars = list(text)
     lines: list[str] = []
-    current = chars[0]
-    for ch in chars[1:]:
-        test = f"{current}{ch}"
+    current = words[0]
+    for word in words[1:]:
+        test = f"{current} {word}"
         bbox = draw.textbbox((0, 0), test, font=font)
         if (bbox[2] - bbox[0]) <= max_width:
             current = test
         else:
             lines.append(current)
-            current = ch
+            current = word
     lines.append(current)
-    return lines
+    return "\n".join(lines)
 
 
 def ease_in_out(t: float) -> float:
     return 0.5 - 0.5 * math.cos(math.pi * t)
 
 
-def render_base_frame(
+def render_motion_image_for_slot(
     source: Image.Image,
-    width: int,
-    height: int,
+    slot_w: int,
+    slot_h: int,
     motion: MotionSpec,
     frame_idx: int,
     num_frames: int,
@@ -118,106 +136,140 @@ def render_base_frame(
     x_shift = motion.x_shift_start + (motion.x_shift_end - motion.x_shift_start) * p
     y_shift = motion.y_shift_start + (motion.y_shift_end - motion.y_shift_start) * p
 
-    cover_scale = max(width / source.width, height / source.height)
-    scale = cover_scale * zoom
-    new_w = max(width, int(source.width * scale))
-    new_h = max(height, int(source.height * scale))
+    base_w, base_h = fit_rect(source.width, source.height, slot_w, slot_h)
+    new_w = max(1, int(base_w * zoom))
+    new_h = max(1, int(base_h * zoom))
     resized = source.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    extra_w = max(0, new_w - width)
-    extra_h = max(0, new_h - height)
+    if new_w <= slot_w and new_h <= slot_h:
+        slot = Image.new("RGB", (slot_w, slot_h), "white")
+        extra_w = slot_w - new_w
+        extra_h = slot_h - new_h
+        px = (extra_w // 2) + int(x_shift * extra_w * 0.5)
+        py = (extra_h // 2) + int(y_shift * extra_h * 0.5)
+        px = min(max(0, px), extra_w)
+        py = min(max(0, py), extra_h)
+        slot.paste(resized, (px, py))
+        return slot
 
-    center_x = extra_w // 2
-    center_y = extra_h // 2
-    offset_x = center_x + int(x_shift * extra_w * 0.5)
-    offset_y = center_y + int(y_shift * extra_h * 0.5)
-    offset_x = min(max(0, offset_x), extra_w)
-    offset_y = min(max(0, offset_y), extra_h)
-
-    crop = resized.crop((offset_x, offset_y, offset_x + width, offset_y + height))
-    return crop.convert("RGB")
+    extra_w = max(0, new_w - slot_w)
+    extra_h = max(0, new_h - slot_h)
+    ox = (extra_w // 2) + int(x_shift * extra_w * 0.5)
+    oy = (extra_h // 2) + int(y_shift * extra_h * 0.5)
+    ox = min(max(0, ox), extra_w)
+    oy = min(max(0, oy), extra_h)
+    return resized.crop((ox, oy, ox + slot_w, oy + slot_h)).convert("RGB")
 
 
-def draw_overlay(
-    image: Image.Image,
+def render_layout_frame(
+    source: Image.Image,
+    *,
+    width: int,
+    height: int,
+    frame_idx: int,
+    num_frames: int,
+    motion: MotionSpec,
     question: str,
     options: dict[str, str],
     show_panel: bool,
     lit_choice: str | None,
     font_path: str | None,
 ) -> Image.Image:
-    w, h = image.size
-    canvas = image.convert("RGBA")
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
 
-    border = max(3, w // 500)
-    margin = max(16, w // 50)
+    border = max(6, width // 320)
+    margin = max(20, width // 48)
 
-    corner_w = int(w * 0.15)
-    corner_h = int(h * 0.11)
+    outer = (margin, margin, width - margin, height - margin)
+    draw.rectangle(outer, outline="black", width=border)
+
+    corner_w = int(width * 0.16)
+    corner_h = int(height * 0.12)
+    corner_inset_x = int(width * 0.02)
+    corner_inset_y = int(height * 0.015)
+
+    ax1 = outer[0] + corner_inset_x
+    ay1 = outer[1] + corner_inset_y
+    bx1 = outer[2] - corner_inset_x - corner_w
+    by1 = ay1
+    cx1 = ax1
+    cy1 = outer[3] - corner_inset_y - corner_h
+    dx1 = bx1
+    dy1 = cy1
+
     corners = {
-        "A": (margin, margin, margin + corner_w, margin + corner_h),
-        "B": (w - margin - corner_w, margin, w - margin, margin + corner_h),
-        "C": (margin, h - margin - corner_h, margin + corner_w, h - margin),
-        "D": (w - margin - corner_w, h - margin - corner_h, w - margin, h - margin),
+        "A": (ax1, ay1, ax1 + corner_w, ay1 + corner_h),
+        "B": (bx1, by1, bx1 + corner_w, by1 + corner_h),
+        "C": (cx1, cy1, cx1 + corner_w, cy1 + corner_h),
+        "D": (dx1, dy1, dx1 + corner_w, dy1 + corner_h),
     }
 
-    label_font = load_font(font_path, size=max(18, int(h * 0.06)))
+    label_font = load_font(font_path, size=max(16, int(height * 0.065)))
     for label, rect in corners.items():
-        is_lit = lit_choice == label
-        fill = (55, 55, 55, 220) if is_lit else (245, 245, 245, 220)
-        text_fill = (255, 255, 255, 255) if is_lit else (20, 20, 20, 255)
-        draw.rounded_rectangle(rect, radius=max(8, corner_h // 8), fill=fill, outline=(0, 0, 0, 255), width=border)
-        bbox = draw.textbbox((0, 0), label, font=label_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        tx = rect[0] + (corner_w - tw) // 2
-        ty = rect[1] + (corner_h - th) // 2 - 1
-        draw.text((tx, ty), label, fill=text_fill, font=label_font)
+        fill = (35, 35, 35) if lit_choice == label else (255, 255, 255)
+        text_fill = (255, 255, 255) if lit_choice == label else (0, 0, 0)
+        draw.rectangle(rect, outline="black", width=border, fill=fill)
+        draw_centered_text(draw, rect, label, label_font, fill=text_fill)
 
+    center_w = int(width * 0.5)
+    center_h = int(height * 0.54)
+    center_x1 = (width - center_w) // 2
+    center_y1 = (height - center_h) // 2
+    center_rect = (center_x1, center_y1, center_x1 + center_w, center_y1 + center_h)
+    draw.rectangle(center_rect, outline="black", width=border)
+
+    padding = int(width * 0.03)
+    question_font = load_font(font_path, size=max(16, int(height * 0.05)))
+    option_font = load_font(font_path, size=max(14, int(height * 0.04)))
+
+    text_x = center_rect[0] + padding
+    text_max_w = center_w - 2 * padding
+    image_top = center_rect[1] + padding
     if show_panel:
-        panel_w = int(w * 0.72)
-        panel_h = int(h * 0.36)
-        px1 = (w - panel_w) // 2
-        py1 = (h - panel_h) // 2
-        px2 = px1 + panel_w
-        py2 = py1 + panel_h
+        text_y = center_rect[1] + padding
+        wrapped_question = wrap_text_multiline(draw, question, question_font, text_max_w)
+        draw.multiline_text((text_x, text_y), wrapped_question, fill="black", font=question_font, spacing=10)
 
-        draw.rounded_rectangle(
-            (px1, py1, px2, py2),
-            radius=max(14, min(w, h) // 40),
-            fill=(245, 245, 245, 222),
-            outline=(0, 0, 0, 230),
-            width=border,
+        qbbox = draw.multiline_textbbox((text_x, text_y), wrapped_question, font=question_font, spacing=10)
+        options_y = qbbox[3] + int(height * 0.02)
+        options_text = (
+            f"A. {options['A']}   |   B. {options['B']}   |   "
+            f"C. {options['C']}   |   D. {options['D']}"
         )
+        wrapped_options = wrap_text_multiline(draw, options_text, option_font, text_max_w)
+        draw.multiline_text((text_x, options_y), wrapped_options, fill="black", font=option_font, spacing=8)
 
-        padding = max(16, w // 60)
-        title_font = load_font(font_path, size=max(18, int(h * 0.04)))
-        body_font = load_font(font_path, size=max(16, int(h * 0.032)))
+        obbox = draw.multiline_textbbox((text_x, options_y), wrapped_options, font=option_font, spacing=8)
+        image_top = obbox[3] + int(height * 0.03)
 
-        text_x = px1 + padding
-        text_y = py1 + padding
-        text_max_w = panel_w - 2 * padding
+    image_bottom = center_rect[3] - padding
+    min_image_h = max(48, int(height * 0.18))
+    if (image_bottom - image_top) < min_image_h:
+        image_top = max(center_rect[1] + padding, image_bottom - min_image_h)
 
-        question_lines = wrap_text(draw, question, title_font, text_max_w)
-        for line in question_lines[:3]:
-            draw.text((text_x, text_y), line, fill=(10, 10, 10, 255), font=title_font)
-            bbox = draw.textbbox((0, 0), line, font=title_font)
-            text_y += (bbox[3] - bbox[1]) + 8
+    image_area = (
+        center_rect[0] + padding,
+        image_top,
+        center_rect[2] - padding,
+        image_bottom,
+    )
+    draw.rectangle(image_area, outline="black", width=max(2, border // 2))
 
-        text_y += 4
-        for choice in CHOICES:
-            line = f"{choice}. {options[choice]}"
-            wrapped = wrap_text(draw, line, body_font, text_max_w)
-            for sub in wrapped[:2]:
-                draw.text((text_x, text_y), sub, fill=(20, 20, 20, 255), font=body_font)
-                bbox = draw.textbbox((0, 0), sub, font=body_font)
-                text_y += (bbox[3] - bbox[1]) + 6
-            if text_y > py2 - padding:
-                break
-
-    return Image.alpha_composite(canvas, overlay).convert("RGB")
+    slot_w = max(1, image_area[2] - image_area[0] - int(width * 0.02))
+    slot_h = max(1, image_area[3] - image_area[1] - int(height * 0.02))
+    moving_img = render_motion_image_for_slot(
+        source=source,
+        slot_w=slot_w,
+        slot_h=slot_h,
+        motion=motion,
+        frame_idx=frame_idx,
+        num_frames=num_frames,
+    )
+    px = image_area[0] + (image_area[2] - image_area[0] - moving_img.width) // 2
+    py = image_area[1] + (image_area[3] - image_area[1] - moving_img.height) // 2
+    canvas.paste(moving_img, (px, py))
+    return canvas
 
 
 def render_sample_frames(
@@ -240,18 +292,15 @@ def render_sample_frames(
     with Image.open(source_path) as src:
         src_rgb = src.convert("RGB")
         for frame_idx in range(num_frames):
-            base = render_base_frame(
+            show_panel = (overlay_mode == "all_frames") or (frame_idx == 0)
+            lit_choice = answer if highlight_start <= frame_idx <= highlight_end else None
+            composed = render_layout_frame(
                 source=src_rgb,
                 width=width,
                 height=height,
-                motion=motion,
                 frame_idx=frame_idx,
                 num_frames=num_frames,
-            )
-            show_panel = (overlay_mode == "all_frames") or (frame_idx == 0)
-            lit_choice = answer if highlight_start <= frame_idx <= highlight_end else None
-            composed = draw_overlay(
-                image=base,
+                motion=motion,
                 question=question,
                 options=options,
                 show_panel=show_panel,
